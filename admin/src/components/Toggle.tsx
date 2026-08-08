@@ -23,9 +23,12 @@ export function Toggle({
         checked ? 'bg-brand-500' : 'bg-ink-700'
       }`}
     >
+      {/* left задан явно: без него absolute-элемент встаёт на «статическую»
+          позицию, а у кнопки текст выровнен по центру — и кружок уезжает
+          вправо, за пределы пилюли */}
       <span
-        className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform ${
-          checked ? 'translate-x-[1.125rem]' : 'translate-x-0.5'
+        className={`absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white transition-transform ${
+          checked ? 'translate-x-4' : 'translate-x-0'
         }`}
       />
     </button>
