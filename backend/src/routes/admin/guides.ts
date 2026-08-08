@@ -25,6 +25,7 @@ const listSelect = {
   version: true,
   categoryId: true,
   isPinned: true,
+  isPublic: true,
   sortOrder: true,
   reviewAt: true,
   publishedAt: true,
@@ -83,7 +84,11 @@ export async function adminGuideRoutes(app: FastifyInstance) {
   // ===== Новый черновик =====
   app.post('/admin/guides', editor, async (req, reply) => {
     const body = z
-      .object({ title: z.string().min(1).max(300), categoryId: z.coerce.number().int().positive() })
+      .object({
+        title: z.string().min(1).max(300),
+        categoryId: z.coerce.number().int().positive(),
+        isPublic: z.boolean().optional(),
+      })
       .safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: 'Нужны заголовок и категория' });
 
@@ -99,11 +104,12 @@ export async function adminGuideRoutes(app: FastifyInstance) {
         contentDraft: EMPTY_DOC as never,
         authorId: currentUser(req).id,
         status: 'DRAFT',
+        isPublic: body.data.isPublic ?? false,
       },
       select: listSelect,
     });
 
-    await audit(req, 'guide.create', 'Guide', guide.id, { title: guide.title });
+    await audit(req, 'guide.create', 'Guide', guide.id, { title: guide.title, isPublic: guide.isPublic });
     return flattenTags(guide);
   });
 
@@ -255,6 +261,32 @@ export async function adminGuideRoutes(app: FastifyInstance) {
       changeNote: body.success ? body.data.changeNote : undefined,
     });
 
+    return flattenTags(updated);
+  });
+
+  // ===== Публичная видимость =====
+  //
+  // Отдельным роутом, а не полем в PATCH: PATCH — это автосохранение редактора,
+  // и оно попутно продлевает мягкую блокировку. Щелчок тумблера в списке
+  // помечал бы гайд «занят» на пять минут для всех остальных редакторов.
+  app.post('/admin/guides/:id/visibility', editor, async (req, reply) => {
+    const { id } = z.object({ id: z.coerce.number().int().positive() }).parse(req.params);
+    const body = z.object({ isPublic: z.boolean() }).safeParse(req.body);
+    if (!body.success) return reply.code(400).send({ error: 'Ожидается isPublic: true|false' });
+
+    const guide = await prisma.guide.findUnique({ where: { id }, include: { category: true } });
+    if (!guide) return reply.code(404).send({ error: 'Гайд не найден' });
+
+    const updated = await prisma.guide.update({
+      where: { id },
+      data: { isPublic: body.data.isPublic, updatedById: currentUser(req).id },
+      select: listSelect,
+    });
+
+    // Меняется то, что видит гость на всех страницах разом: и карточка
+    // в разделе, и счётчики в шапке, и сама страница гайда
+    await invalidateGuide(updated.slug, guide.category.slug);
+    await audit(req, 'guide.visibility', 'Guide', id, { isPublic: body.data.isPublic });
     return flattenTags(updated);
   });
 

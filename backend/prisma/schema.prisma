@@ -169,6 +169,9 @@ model Guide {
   updatedById Int?
 
   isPinned         Boolean    @default(false)
+  /// Виден ли гайд снаружи, без входа. По умолчанию нет: гайд заводят закрытым,
+  /// открывают осознанно. База знаний открыта всегда, но показывает только такие.
+  isPublic         Boolean    @default(false)
   sortOrder        Int        @default(0)
   /// Роли, для которых гайд обязателен к прочтению (для отчёта «покрытие»)
   requiredForRoles TeamRole[] @default([])
@@ -195,6 +198,8 @@ model Guide {
   @@index([status, categoryId])
   @@index([publishedAt])
   @@index([reviewAt])
+  /// Выдача гостю всегда идёт по этой паре — гость видит только опубликованное и открытое
+  @@index([status, isPublic])
 }
 
 /// Снимок каждой правки — как TicketVersion в polina-crm

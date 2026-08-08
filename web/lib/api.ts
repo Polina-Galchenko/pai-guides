@@ -58,16 +58,42 @@ export async function serverFetch<T>(
 }
 
 /**
- * Публичный (не персональный) контент: кэшируется ISR, cookie НЕ пробрасывается.
- * Именно так тянутся гайды и категории — иначе кэш стал бы персональным.
+ * Кому показываем: своим — всё опубликованное, гостю — только гайды,
+ * помеченные «доступно публично». Решает backend, здесь мы лишь говорим,
+ * от чьего имени пришли.
  */
-export async function publicFetch<T>(path: string, revalidate = 3600, tags?: string[]): Promise<T> {
-  const res = await fetch(`${API_INTERNAL}/api${path}`, {
-    headers: { 'x-internal-token': process.env.REVALIDATE_SECRET ?? '' },
+export type Audience = 'member' | 'guest';
+
+/**
+ * Не персональный контент: кэшируется ISR, cookie НЕ пробрасывается — иначе
+ * кэш стал бы персональным. Именно так тянутся гайды и категории.
+ *
+ * Свой запрос идёт с внутренним токеном, гостевой — вообще без учётных данных.
+ * Метка `as=guest` в адресе нужна ровно для кэша Next.js: он ключует записи по
+ * URL, и без неё две аудитории делили бы одну запись — гость получил бы ответ,
+ * собранный для своих. Backend этот параметр игнорирует: определять доступ по
+ * тому, что прислал клиент, нельзя.
+ */
+export async function contentFetch<T>(
+  audience: Audience,
+  path: string,
+  revalidate = 3600,
+  tags?: string[],
+): Promise<T> {
+  const guest = audience === 'guest';
+  const url = `${API_INTERNAL}/api${path}${guest ? (path.includes('?') ? '&' : '?') + 'as=guest' : ''}`;
+
+  const res = await fetch(url, {
+    headers: guest ? {} : { 'x-internal-token': process.env.REVALIDATE_SECRET ?? '' },
     next: { revalidate, tags },
   });
   if (!res.ok) throw new ApiError(res.status, `Ошибка API ${res.status}`);
   return res.json() as Promise<T>;
+}
+
+/** То же самое от имени своего — для страниц, которые гостю не отдаются. */
+export function publicFetch<T>(path: string, revalidate = 3600, tags?: string[]): Promise<T> {
+  return contentFetch<T>('member', path, revalidate, tags);
 }
 
 export interface Me {
@@ -90,4 +116,12 @@ export async function getMe(): Promise<Me | null> {
   } catch {
     return null;
   }
+}
+
+/**
+ * Правило то же, что на backend: `NONE` — это зарегистрировался, но доступ ему
+ * ещё не выдали, и видеть он должен ровно то же, что случайный прохожий.
+ */
+export function audienceOf(me: Me | null): Audience {
+  return me && me.role !== 'NONE' ? 'member' : 'guest';
 }

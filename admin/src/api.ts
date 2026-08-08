@@ -156,6 +156,8 @@ export interface GuideListItem {
   categoryId: number;
   category?: { id: number; title: string; slug: string };
   isPinned: boolean;
+  /** Виден ли гайд снаружи, без входа */
+  isPublic: boolean;
   sortOrder: number;
   reviewAt: string | null;
   publishedAt: string | null;

@@ -4,44 +4,27 @@ import { jwtVerify } from 'jose';
 const ACCESS_COOKIE = 'pai_at';
 const REFRESH_COOKIE = 'pai_rt';
 
-/** Страницы, доступные без входа. */
+/** Страницы, доступные без входа независимо ни от чего. */
 const PUBLIC_PATHS = ['/login', '/invite'];
 
 const secret = new TextEncoder().encode(process.env.JWT_SECRET ?? 'dev-insecure-secret-change-me-please-32-chars-min');
 
-// lib/api.ts сюда не годится: он тянет next/headers, а middleware живёт в Edge Runtime
-const API_INTERNAL = (
-  process.env.API_INTERNAL_URL ??
-  process.env.NEXT_PUBLIC_API_URL ??
-  'http://localhost:3001'
-).replace(/\/+$/, '');
+/**
+ * Разделы базы знаний, открытые всем. Гость видит их всегда — но только те
+ * гайды, что помечены «доступно публично»; остальные для него не существуют.
+ */
+const KNOWLEDGE_BASE = [/^\/$/, /^\/c(\/|$)/, /^\/g(\/|$)/, /^\/search$/];
 
 /**
- * Открыт ли публичный доступ (тумблер в админке, §7).
+ * Страницы, которые Next.js собирает заранее (ISR) и отдаёт готовым HTML.
+ * У них две версии — своя и гостевая, — потому что список гайдов в них разный,
+ * а одна запись кэша не может быть одновременно и той, и другой. Гостя уводим
+ * в ветку `/guest/...`; адрес в браузере при этом не меняется.
  *
- * Спрашиваем backend, а не переменную окружения: тумблер должен срабатывать без
- * пересборки образа. Ответ держим в памяти процесса 10 секунд — иначе каждый
- * запрос страницы тянул бы за собой ещё один сетевой round-trip. Столько же
- * длится и задержка выключения: закрыли доступ — гости отваливаются в течение
- * десяти секунд.
- *
- * Backend не ответил — считаем, что закрыто: калитка по умолчанию заперта.
+ * `/` и `/search` сюда не входят: они и так динамические и разбираются
+ * с аудиторией сами, читая cookie (см. `audienceOf`).
  */
-let accessCache: { open: boolean; at: number } | null = null;
-const ACCESS_TTL_MS = 10_000;
-
-async function isPublicAccessOpen(): Promise<boolean> {
-  if (accessCache && Date.now() - accessCache.at < ACCESS_TTL_MS) return accessCache.open;
-  try {
-    const res = await fetch(`${API_INTERNAL}/api/access`, { cache: 'no-store' });
-    if (!res.ok) return false;
-    const data = (await res.json()) as { open?: boolean };
-    accessCache = { open: data.open === true, at: Date.now() };
-    return accessCache.open;
-  } catch {
-    return false;
-  }
-}
+const PRERENDERED = [/^\/c(\/|$)/, /^\/g(\/|$)/];
 
 /**
  * Гейт доступа до отдачи страницы (Edge Runtime).
@@ -50,11 +33,24 @@ async function isPublicAccessOpen(): Promise<boolean> {
  * бы готовый HTML гайда любому, кто просто поставил себе куку с этим именем.
  * Ровно та же логика на проде живёт в Cloudflare Worker (PLAN §6.4).
  *
- * Если access истёк, но refresh есть — пропускаем на страницу: там клиентский код
- * обновит пару токенов. Иначе человека выкидывало бы на /login каждые 15 минут.
+ * Роль берём из самого токена: `NONE` — это «зарегистрировался, но админ ещё
+ * не подтвердил», и такому человеку полагается гостевая выдача, а не полная.
+ * Роль в токене живёт до 15 минут, то есть может отставать от базы, — поэтому
+ * решение здесь принимается только в сторону «показать меньше»: полный доступ
+ * к личным данным всё равно проверяет backend на каждом запросе.
  */
 export async function middleware(req: NextRequest) {
   const { pathname, search } = req.nextUrl;
+
+  // Ветка `/guest` — внутренняя цель rewrite'а, а не адрес. Rewrite middleware
+  // повторно не запускает, поэтому сюда попадают только те, кто набрал такой
+  // путь руками; уводим их на настоящий адрес, чтобы не заводить второй набор
+  // URL на те же страницы.
+  if (pathname.startsWith('/guest/') || pathname === '/guest') {
+    const url = req.nextUrl.clone();
+    url.pathname = pathname.slice('/guest'.length) || '/';
+    return NextResponse.redirect(url);
+  }
 
   if (
     pathname.startsWith('/_next') ||
@@ -66,24 +62,19 @@ export async function middleware(req: NextRequest) {
     return NextResponse.next();
   }
 
-  const access = req.cookies.get(ACCESS_COOKIE)?.value;
-  if (access) {
-    try {
-      await jwtVerify(access, secret);
-      return NextResponse.next();
-    } catch {
-      // истёк или подделан — падаем ниже, к refresh
-    }
+  if (await isMember(req)) return NextResponse.next();
+
+  if (KNOWLEDGE_BASE.some((re) => re.test(pathname))) {
+    if (!PRERENDERED.some((re) => re.test(pathname))) return NextResponse.next();
+    const url = req.nextUrl.clone();
+    url.pathname = `/guest${pathname}`;
+    return NextResponse.rewrite(url);
   }
 
-  if (req.cookies.get(REFRESH_COOKIE)?.value) {
-    return NextResponse.next();
-  }
-
-  // Гостя пускаем, только если доступ открыт тумблером в админке
-  if (await isPublicAccessOpen()) {
-    return NextResponse.next();
-  }
+  // Личное (профиль, прогресс) — только своим. Истёкший access при живом
+  // refresh пропускаем: на странице клиентский код обновит пару токенов,
+  // иначе человека выкидывало бы на /login каждые 15 минут.
+  if (req.cookies.get(REFRESH_COOKIE)?.value) return NextResponse.next();
 
   // Внешний адрес берём из заголовков, а не из req.nextUrl: за обратным прокси
   // Next.js строит nextUrl от адреса, на котором слушает сам (127.0.0.1:3000),
@@ -95,6 +86,18 @@ export async function middleware(req: NextRequest) {
   const url = new URL(`${proto}://${host}/login`);
   if (pathname !== '/') url.searchParams.set('next', pathname + search);
   return NextResponse.redirect(url);
+}
+
+/** Есть ли живой access-токен с ролью не ниже VIEWER. */
+async function isMember(req: NextRequest): Promise<boolean> {
+  const access = req.cookies.get(ACCESS_COOKIE)?.value;
+  if (!access) return false;
+  try {
+    const { payload } = await jwtVerify(access, secret);
+    return typeof payload.role === 'string' && payload.role !== 'NONE';
+  } catch {
+    return false; // истёк или подделан
+  }
 }
 
 export const config = {

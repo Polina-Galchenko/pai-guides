@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { publicFetch, serverFetch } from '@/lib/api';
+import { audienceOf, contentFetch, getMe, serverFetch } from '@/lib/api';
 import type { CategoryNode, SearchHit } from '@/lib/types';
 import { readingTimeLabel } from '@/lib/types';
 import { EmptyState, Header } from '@/components/Shell';
@@ -12,14 +12,15 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
   const { q = '' } = await searchParams;
   const query = q.trim();
 
-  const categories = await publicFetch<CategoryNode[]>('/categories', 3600, ['categories']);
+  const categories = await contentFetch<CategoryNode[]>(audienceOf(await getMe()), '/categories', 3600, ['categories']);
 
   let hits: SearchHit[] = [];
   let suggestions: { slug: string; title: string }[] = [];
 
   if (query.length >= 2) {
-    // Через serverFetch, а не publicFetch: запрос пишется в SearchQuery
-    // вместе с userId — это сигнал «каких гайдов не хватает» (§5.4)
+    // Через serverFetch, а не contentFetch: запрос пишется в SearchQuery
+    // вместе с userId — это сигнал «каких гайдов не хватает» (§5.4).
+    // Он же решает вопрос выдачи: с cookie гостя backend не спутает со своим
     const result = await serverFetch<{ items: SearchHit[] }>(`/search?q=${encodeURIComponent(query)}`).catch(() => ({
       items: [],
     }));

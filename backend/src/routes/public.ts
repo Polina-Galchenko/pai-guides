@@ -1,4 +1,4 @@
-import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { prisma } from '../db.js';
 import { env } from '../env.js';
@@ -6,31 +6,64 @@ import { requireAuth, roleAtLeast, tryAuth } from '../auth.js';
 import { asDoc, collectHeadings } from '../content/schema.js';
 import { buildRenderContext } from '../services/guides.js';
 import { serializeMedia } from '../services/mediaView.js';
-import { isPublicAccessOpen } from '../settings.js';
 
 /**
- * Публичный контент читают двое: авторизованный человек и сам сервис `web`,
- * который заранее генерирует HTML страниц (ISR). У второго cookie нет и быть
- * не может — поэтому он приходит с внутренним токеном.
+ * Кому отвечаем. Не «пускать или нет», а «сколько показать»: база знаний
+ * открыта всегда, но гость видит только гайды с `isPublic`.
  *
- * Это безопасно ровно потому, что `web` сам никого не пускает: его middleware
- * проверяет подпись JWT до отдачи страницы (PLAN §5.3 и §6.4).
+ *   member — свой: вошедший читатель ИЛИ сам сервис `web`, который заранее
+ *            генерирует HTML страниц (ISR) и приходит с внутренним токеном;
+ *   guest  — все остальные, включая совсем анонимных.
  *
- * Третий случай — включённый в админке публичный доступ: тогда гайды читает кто
- * угодно без входа. Личное (прогресс, фидбек, «обязательное для роли») сюда не
- * попадает — те роуты как были под `requireAuth`, так и остаются.
+ * `NONE` (зарегистрировался, но админ ещё не подтвердил) — это guest: доступа
+ * ему не выдавали, и видеть он должен ровно то же, что случайный прохожий.
  */
-async function requireReaderOrInternal(req: FastifyRequest, reply: FastifyReply) {
-  const internal = req.headers['x-internal-token'];
-  if (typeof internal === 'string' && internal && internal === env.revalidateSecret) return;
+type Audience = 'member' | 'guest';
 
-  if (await isPublicAccessOpen()) return;
-
-  const user = await tryAuth(req);
-  if (!user) return reply.code(401).send({ error: 'Не авторизован' });
-  if (!roleAtLeast(user.role, 'VIEWER')) {
-    return reply.code(403).send({ error: 'Доступ ещё не выдан администратором' });
+declare module 'fastify' {
+  interface FastifyRequest {
+    audience?: Audience;
   }
+}
+
+async function resolveAudience(req: FastifyRequest) {
+  const internal = req.headers['x-internal-token'];
+  if (typeof internal === 'string' && internal && internal === env.revalidateSecret) {
+    req.audience = 'member';
+    return;
+  }
+  const user = await tryAuth(req);
+  req.audience = user && roleAtLeast(user.role, 'VIEWER') ? 'member' : 'guest';
+}
+
+function isGuest(req: FastifyRequest): boolean {
+  return req.audience !== 'member';
+}
+
+/**
+ * Что гость имеет право увидеть. Одно место на все выборки — иначе рано или
+ * поздно новый эндпоинт забудет про фильтр и отдаст наружу закрытый гайд.
+ */
+function visibleWhere(req: FastifyRequest): { status: 'PUBLISHED'; isPublic?: true } {
+  return isGuest(req) ? { status: 'PUBLISHED', isPublic: true } : { status: 'PUBLISHED' };
+}
+
+interface CategoryNode {
+  id: number;
+  parentId: number | null;
+  guideCount: number;
+  children: CategoryNode[];
+  [field: string]: unknown;
+}
+
+/** Есть ли в поддереве хоть один видимый гайд. */
+function hasVisibleGuides(node: CategoryNode): boolean {
+  return node.guideCount > 0 || node.children.some(hasVisibleGuides);
+}
+
+/** То же дерево, но без пустых веток. */
+function pruneEmpty(node: CategoryNode): CategoryNode {
+  return { ...node, children: node.children.filter(hasVisibleGuides).map(pruneEmpty) };
 }
 
 const cardSelect = {
@@ -61,32 +94,28 @@ function toCard<T extends CardRow>(g: T) {
 }
 
 export async function publicRoutes(app: FastifyInstance) {
-  const reader = { preHandler: requireReaderOrInternal };
-
-  // ===== Режим доступа =====
-  //
-  // Отвечает без авторизации намеренно: это единственный способ для middleware
-  // сайта узнать, пускать ли гостя, — у гостя ни куки, ни внутреннего токена
-  // нет. Наружу уходит один булев флаг, ничего чувствительного.
-  app.get('/access', async () => ({ open: await isPublicAccessOpen() }));
+  const reader = { preHandler: resolveAudience };
 
   // ===== Дерево категорий со счётчиками =====
-  app.get('/categories', reader, async () => {
+  app.get('/categories', reader, async (req) => {
     const [categories, counts] = await Promise.all([
       prisma.category.findMany({ orderBy: [{ sortOrder: 'asc' }, { title: 'asc' }] }),
-      prisma.guide.groupBy({ by: ['categoryId'], where: { status: 'PUBLISHED' }, _count: { _all: true } }),
+      prisma.guide.groupBy({ by: ['categoryId'], where: visibleWhere(req), _count: { _all: true } }),
     ]);
     const countBy = new Map(counts.map((c) => [c.categoryId, c._count._all]));
 
-    const nodes = categories.map((c) => ({ ...c, guideCount: countBy.get(c.id) ?? 0, children: [] as unknown[] }));
+    const nodes = categories.map((c) => ({ ...c, guideCount: countBy.get(c.id) ?? 0, children: [] as CategoryNode[] }));
     const byId = new Map(nodes.map((n) => [n.id, n]));
-    const roots: typeof nodes = [];
+    const roots: CategoryNode[] = [];
     for (const node of nodes) {
       const parent = node.parentId ? byId.get(node.parentId) : null;
       if (parent) parent.children.push(node);
       else roots.push(node);
     }
-    return roots;
+
+    // Гостю пустые разделы не показываем совсем: раздел без единого открытого
+    // гайда — это ссылка в никуда, а заодно и подсказка о внутренней структуре
+    return isGuest(req) ? roots.filter(hasVisibleGuides).map(pruneEmpty) : roots;
   });
 
   // ===== Карточки гайдов =====
@@ -103,7 +132,7 @@ export async function publicRoutes(app: FastifyInstance) {
       })
       .parse(req.query);
 
-    const where: any = { status: 'PUBLISHED' };
+    const where: any = { ...visibleWhere(req) };
     if (q.category) where.category = { slug: q.category };
     if (q.tag) where.tags = { some: { tag: { slug: q.tag } } };
     if (q.level) where.level = q.level;
@@ -135,10 +164,16 @@ export async function publicRoutes(app: FastifyInstance) {
         author: { select: { id: true, name: true } },
         tags: { select: { tag: true } },
         cover: true,
-        related: { select: { to: { select: cardSelect } } },
+        // «Читайте также» фильтруем на уровне запроса: блок собирается из
+        // связей, а связать могли и с черновиком, и с закрытым гайдом —
+        // название такого гостю показывать нельзя, да и вести оно будет в 404
+        related: { where: { to: visibleWhere(req) }, select: { to: { select: cardSelect } } },
       },
     });
-    if (!guide || guide.status !== 'PUBLISHED') {
+    // Гостю закрытый гайд — именно 404, а не 403: «такого гайда нет» не
+    // подтверждает, что он есть, и по прямой ссылке наружу не утекает даже
+    // факт существования
+    if (!guide || guide.status !== 'PUBLISHED' || (isGuest(req) && !guide.isPublic)) {
       return reply.code(404).send({ error: 'Гайд не найден' });
     }
 
@@ -315,6 +350,8 @@ export async function publicRoutes(app: FastifyInstance) {
       FROM "Guide" g
       JOIN "Category" c ON c.id = g."categoryId"
       WHERE g.status = 'PUBLISHED'
+        -- своим видно всё опубликованное, гостю — только открытое
+        AND (${!isGuest(req)}::boolean OR g."isPublic")
         AND g.tsv @@ websearch_to_tsquery('russian', ${query})
       ORDER BY rank DESC, g."publishedAt" DESC
       LIMIT ${q.limit}
@@ -322,9 +359,9 @@ export async function publicRoutes(app: FastifyInstance) {
 
     // Каждый запрос — сигнал «каких гайдов не хватает» (§5.4).
     // Пишем в фоне: поиск не должен ждать запись статистики.
-    const user = await tryAuth(req);
+    // Пользователя уже достал resolveAudience — второй раз в базу не идём.
     void prisma.searchQuery
-      .create({ data: { q: query.slice(0, 200), resultCount: rows.length, userId: user?.id ?? null } })
+      .create({ data: { q: query.slice(0, 200), resultCount: rows.length, userId: req.currentUser?.id ?? null } })
       .catch(() => {});
 
     return { items: rows, total: rows.length, q: query };
@@ -339,7 +376,9 @@ export async function publicRoutes(app: FastifyInstance) {
     return prisma.$queryRaw<Array<{ slug: string; title: string }>>`
       SELECT slug, title
       FROM "Guide"
-      WHERE status = 'PUBLISHED' AND similarity(title, ${query}) > 0.2
+      WHERE status = 'PUBLISHED'
+        AND (${!isGuest(req)}::boolean OR "isPublic")
+        AND similarity(title, ${query}) > 0.2
       ORDER BY similarity(title, ${query}) DESC
       LIMIT 5
     `;

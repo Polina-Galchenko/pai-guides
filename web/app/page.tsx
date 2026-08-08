@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { getMe, publicFetch, serverFetch } from '@/lib/api';
+import { audienceOf, contentFetch, getMe, serverFetch } from '@/lib/api';
 import type { CategoryNode, GuideCard } from '@/lib/types';
 import { TEAM_ROLE_LABEL } from '@/lib/types';
 import { EmptyState, GuideCardView, Header } from '@/components/Shell';
@@ -11,13 +11,16 @@ export const dynamic = 'force-dynamic';
 
 export default async function HomePage() {
   const me = await getMe();
+  // Страница и так динамическая, так что аудиторию определяем прямо здесь —
+  // отдельная гостевая ветка маршрутов нужна только заранее собранным страницам
+  const audience = audienceOf(me);
 
   const weekAgo = new Date(Date.now() - 7 * 86400_000).toISOString();
   const [categories, pinned, fresh, required] = await Promise.all([
-    publicFetch<CategoryNode[]>('/categories', 3600, ['categories']),
-    publicFetch<{ items: GuideCard[] }>('/guides?pinned=1&limit=6', 600, ['guides']),
-    publicFetch<{ items: GuideCard[] }>(`/guides?since=${weekAgo}&limit=6`, 600, ['guides']),
-    me ? serverFetch<GuideCard[]>('/guides/required/mine').catch(() => []) : Promise.resolve([]),
+    contentFetch<CategoryNode[]>(audience, '/categories', 3600, ['categories']),
+    contentFetch<{ items: GuideCard[] }>(audience, '/guides?pinned=1&limit=6', 600, ['guides']),
+    contentFetch<{ items: GuideCard[] }>(audience, `/guides?since=${weekAgo}&limit=6`, 600, ['guides']),
+    audience === 'member' ? serverFetch<GuideCard[]>('/guides/required/mine').catch(() => []) : Promise.resolve([]),
   ]);
 
   const notRead = required.filter((g) => !g.readAt);

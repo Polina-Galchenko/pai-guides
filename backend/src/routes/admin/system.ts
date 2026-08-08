@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { prisma } from '../../db.js';
 import { requireRole } from '../../auth.js';
 import { audit } from '../../audit.js';
-import { getAllSettings, setSetting, SETTING_KEYS } from '../../settings.js';
+import { getAllSettings, setSetting } from '../../settings.js';
 import { netcheck } from '../../services/netcheck.js';
 
 /** Ключи настроек, которые можно менять из админки. Остальное — только через .env. */
@@ -12,11 +12,7 @@ const EDITABLE_SETTINGS = new Set<string>([
   'analytics.read_time_ratio',
   'google.refresh_token',
   'google.root_folder_id',
-  SETTING_KEYS.publicAccess,
 ]);
-
-/** Настройки-переключатели: в базе должен лежать булев, а не строка «false». */
-const BOOLEAN_SETTINGS = new Set<string>([SETTING_KEYS.publicAccess]);
 
 export async function adminSystemRoutes(app: FastifyInstance) {
   const onlyAdmin = { preHandler: requireRole('ADMIN') };
@@ -85,18 +81,13 @@ export async function adminSystemRoutes(app: FastifyInstance) {
     if (!body.success) return reply.code(400).send({ error: 'Ожидается объект ключ-значение' });
 
     const applied: string[] = [];
-    // Смена режима доступа — событие уровня «сайт стал открытым»: в журнале
-    // должно быть видно не только что ключ трогали, но и на что он встал
-    const values: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(body.data)) {
       if (!EDITABLE_SETTINGS.has(key)) continue;
       if (value === '***') continue; // не затираем секрет замаскированным значением
-      const normalized = BOOLEAN_SETTINGS.has(key) ? value === true : value;
-      await setSetting(key, normalized);
+      await setSetting(key, value);
       applied.push(key);
-      if (BOOLEAN_SETTINGS.has(key)) values[key] = normalized;
     }
-    await audit(req, 'settings.update', 'Setting', null, { keys: applied, values });
+    await audit(req, 'settings.update', 'Setting', null, { keys: applied });
     return { ok: true, applied };
   });
 

@@ -12,7 +12,6 @@ import { GuideEditor } from './pages/GuideEditor';
 import { Structure } from './pages/Structure';
 import { Backups } from './pages/Backups';
 import { Stats } from './pages/Stats';
-import { Settings } from './pages/Settings';
 
 function Guard({ role, children }: { role?: Role; children: JSX.Element }) {
   const { user, loading, atLeast } = useAuth();
@@ -115,14 +114,6 @@ export default function App() {
           element={
             <Guard role="ADMIN">
               <Audit />
-            </Guard>
-          }
-        />
-        <Route
-          path="/settings"
-          element={
-            <Guard role="ADMIN">
-              <Settings />
             </Guard>
           }
         />

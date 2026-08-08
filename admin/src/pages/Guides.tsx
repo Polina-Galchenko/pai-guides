@@ -3,6 +3,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Copy, Pin, Plus } from 'lucide-react';
 import { api, errText, type Category, type GuideListItem, type GuideStatus, type Paged } from '../api';
+import { Toggle } from '../components/Toggle';
 
 const STATUS_LABEL: Record<GuideStatus, string> = {
   DRAFT: 'Черновик',
@@ -40,6 +41,16 @@ export function Guides() {
   const { data: categories = [] } = useQuery({
     queryKey: ['categories'],
     queryFn: async () => (await api.get<Category[]>('/admin/categories')).data,
+  });
+
+  const setPublic = useMutation({
+    mutationFn: async (v: { id: number; isPublic: boolean }) =>
+      (await api.post<GuideListItem>(`/admin/guides/${v.id}/visibility`, { isPublic: v.isPublic })).data,
+    onSuccess: () => {
+      setError('');
+      void qc.invalidateQueries({ queryKey: ['guides'] });
+    },
+    onError: (e) => setError(errText(e)),
   });
 
   const duplicate = useMutation({
@@ -101,6 +112,7 @@ export function Guides() {
               <th className="table-th">Название</th>
               <th className="table-th">Категория</th>
               <th className="table-th">Статус</th>
+              <th className="table-th">Публично</th>
               <th className="table-th">Версия</th>
               <th className="table-th">Изменён</th>
               <th className="table-th"></th>
@@ -109,7 +121,7 @@ export function Guides() {
           <tbody>
             {isLoading && (
               <tr>
-                <td className="table-td text-ink-500" colSpan={6}>
+                <td className="table-td text-ink-500" colSpan={7}>
                   Загрузка…
                 </td>
               </tr>
@@ -126,6 +138,27 @@ export function Guides() {
                 <td className="table-td text-ink-400">{g.category?.title ?? '—'}</td>
                 <td className="table-td">
                   <span className={`badge ${STATUS_CLS[g.status]}`}>{STATUS_LABEL[g.status]}</span>
+                </td>
+                <td className="table-td">
+                  <div className="flex items-center gap-2">
+                    <Toggle
+                      checked={g.isPublic}
+                      disabled={setPublic.isPending}
+                      label={
+                        g.isPublic
+                          ? 'Гайд открыт: прямая ссылка работает без входа'
+                          : 'Гайд закрыт: виден только вошедшим'
+                      }
+                      onChange={(isPublic) => setPublic.mutate({ id: g.id, isPublic })}
+                    />
+                    {/* Открытый, но неопубликованный гайд снаружи не покажется —
+                        это ловушка, о которой лучше сказать сразу */}
+                    {g.isPublic && g.status !== 'PUBLISHED' && (
+                      <span className="text-xs text-amber-400" title="Снаружи видно только опубликованные гайды">
+                        не опубликован
+                      </span>
+                    )}
+                  </div>
                 </td>
                 <td className="table-td text-ink-500">v{g.version}</td>
                 <td className="table-td whitespace-nowrap text-ink-500">
@@ -144,7 +177,7 @@ export function Guides() {
             ))}
             {data && data.items.length === 0 && (
               <tr>
-                <td className="table-td text-ink-500" colSpan={6}>
+                <td className="table-td text-ink-500" colSpan={7}>
                   Гайдов пока нет
                 </td>
               </tr>
@@ -175,10 +208,11 @@ function NewGuideForm({ categories, onClose }: { categories: Category[]; onClose
   const qc = useQueryClient();
   const [title, setTitle] = useState('');
   const [categoryId, setCategoryId] = useState<number | ''>(categories[0]?.id ?? '');
+  const [isPublic, setIsPublic] = useState(false);
   const [error, setError] = useState('');
 
   const create = useMutation({
-    mutationFn: async () => (await api.post<GuideListItem>('/admin/guides', { title, categoryId })).data,
+    mutationFn: async () => (await api.post<GuideListItem>('/admin/guides', { title, categoryId, isPublic })).data,
     onSuccess: (g) => {
       void qc.invalidateQueries({ queryKey: ['guides'] });
       navigate(`/guides/${g.id}`);
@@ -210,6 +244,19 @@ function NewGuideForm({ categories, onClose }: { categories: Category[]; onClose
           </select>
         </div>
       </div>
+
+      <div className="mt-4 flex items-center gap-3">
+        <Toggle checked={isPublic} label="Доступно публично" onChange={setIsPublic} />
+        <div>
+          <div className="text-sm text-ink-200">Доступно публично</div>
+          <div className="text-xs text-ink-600">
+            {isPublic
+              ? 'Прямая ссылка будет работать без входа — как только гайд опубликуют'
+              : 'Гайд увидят только вошедшие; в открытой базе знаний его не будет'}
+          </div>
+        </div>
+      </div>
+
       {error && <div className="mt-3 rounded-lg bg-red-500/10 px-3 py-2 text-sm text-red-300">{error}</div>}
       <div className="mt-4 flex gap-2">
         <button className="btn-primary" disabled={!title.trim() || !categoryId || create.isPending} onClick={() => create.mutate()}>
