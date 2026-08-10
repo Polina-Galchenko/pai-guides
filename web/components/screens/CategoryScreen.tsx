@@ -9,22 +9,13 @@ import { CategoryList } from '@/components/CategoryList';
 import { PageViewTracker } from '@/components/PageViewTracker';
 
 /**
- * Страница раздела, общая для своих и для гостей — как и страница гайда,
- * с двумя тонкими маршрутами и двумя записями ISR-кэша. Гостю backend отдаёт
- * и урезанный список гайдов, и дерево разделов без пустых веток.
+ * Страница раздела, одна на обе аудитории — как и страница гайда.
+ * Гостю backend отдаёт и урезанный список гайдов, и дерево разделов
+ * без пустых веток.
  */
 
 function flatten(nodes: CategoryNode[]): CategoryNode[] {
   return nodes.flatMap((n) => [n, ...flatten(n.children ?? [])]);
-}
-
-export async function categoryStaticParams(audience: Audience) {
-  try {
-    const categories = await contentFetch<CategoryNode[]>(audience, '/categories', 3600);
-    return flatten(categories).map((c) => ({ category: c.slug }));
-  } catch {
-    return [];
-  }
 }
 
 export async function categoryMetadata(audience: Audience, category: string): Promise<Metadata> {
@@ -34,8 +25,7 @@ export async function categoryMetadata(audience: Audience, category: string): Pr
 }
 
 /**
- * Ни cookie, ни searchParams здесь не читаются — любое из двух сделало бы
- * страницу динамической. Фильтры по тегу и уровню работают на клиенте
+ * searchParams здесь не читаются: фильтры по тегу и уровню работают на клиенте
  * (см. CategoryList), имя пользователя в шапке — тоже.
  */
 export async function CategoryScreen({ audience, category }: { audience: Audience; category: string }) {

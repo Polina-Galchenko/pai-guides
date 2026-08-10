@@ -1,17 +1,15 @@
 import type { Metadata } from 'next';
-import { CategoryScreen, categoryMetadata, categoryStaticParams } from '@/components/screens/CategoryScreen';
+import { audienceOf, getMe } from '@/lib/api';
+import { CategoryScreen, categoryMetadata } from '@/components/screens/CategoryScreen';
 
-// Версия для своих — гостя middleware уводит на /guest/c/[category]
-export const revalidate = 3600;
-
-export function generateStaticParams() {
-  return categoryStaticParams('member');
-}
+// Как и страница гайда: рендер на запрос, данные из кэша с тегами.
+// Подробнее — в комментарии в app/g/[slug]/page.tsx
+export const dynamic = 'force-dynamic';
 
 export async function generateMetadata({ params }: { params: Promise<{ category: string }> }): Promise<Metadata> {
-  return categoryMetadata('member', (await params).category);
+  return categoryMetadata(audienceOf(await getMe()), (await params).category);
 }
 
 export default async function CategoryPage({ params }: { params: Promise<{ category: string }> }) {
-  return <CategoryScreen audience="member" category={(await params).category} />;
+  return <CategoryScreen audience={audienceOf(await getMe())} category={(await params).category} />;
 }

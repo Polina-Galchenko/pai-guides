@@ -11,25 +11,13 @@ import { Feedback } from '@/components/Feedback';
 import { ReadingTracker } from '@/components/ReadingTracker';
 
 /**
- * Страница гайда, общая для своих и для гостей.
+ * Страница гайда, одна на обе аудитории.
  *
  * Разница ровно одна — от чьего имени спрашиваем backend: гостю закрытый гайд
  * отвечает 404, и список разделов в шапке у него свой. Всё остальное совпадает,
- * поэтому вёрстка живёт здесь, а в `app/` остаются два тонких маршрута —
- * `/g/[slug]` и `/guest/g/[slug]`, каждый со своим ISR-кэшем.
+ * поэтому и вёрстка, и загрузка живут здесь, а маршрут в `app/` только
+ * определяет, кто пришёл.
  */
-
-/** Заранее собираем все видимые этой аудитории гайды — их читают чаще всего. */
-export async function guideStaticParams(audience: Audience) {
-  try {
-    const { items } = await contentFetch<{ items: { slug: string }[] }>(audience, '/guides?limit=100', 3600);
-    return items.map((g) => ({ slug: g.slug }));
-  } catch {
-    // На сборке backend может быть недоступен — тогда страницы соберутся по запросу
-    return [];
-  }
-}
-
 async function loadGuide(audience: Audience, slug: string): Promise<GuideFull | null> {
   try {
     return await contentFetch<GuideFull>(audience, `/guides/${encodeURIComponent(slug)}`, 3600, [`guide:${slug}`]);
