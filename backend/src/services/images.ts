@@ -5,6 +5,21 @@ import { storage } from './storage/index.js';
 /** Ширины вариантов (PLAN §3.3). Больше оригинала не апскейлим. */
 export const VARIANT_WIDTHS = [320, 640, 960, 1280, 1920];
 
+/**
+ * Какие ширины нарезать для картинки шириной width.
+ *
+ * Одной сетки мало: скриншот в 900px получал варианты 320 и 640, и сайт,
+ * которому для колонки в 720px нужно больше, растягивал 640 — текст на
+ * скриншоте расплывался. Поэтому исходная ширина — тоже вариант, последний.
+ * Ступень сетки, почти равная исходнику (1280 при 1300), ничего не даёт
+ * и пропускается. Шире 1920 не режем: этого хватает колонке и на ретине.
+ */
+export function variantWidths(width: number): number[] {
+  const max = VARIANT_WIDTHS[VARIANT_WIDTHS.length - 1]!;
+  if (width > max) return [...VARIANT_WIDTHS];
+  return [...VARIANT_WIDTHS.filter((w) => w < width * 0.9), width];
+}
+
 export interface ImageVariant {
   w: number;
   fmt: 'avif' | 'webp';
@@ -38,11 +53,13 @@ export async function processImage(originalKey: string, sha256: string): Promise
   const height = meta.height ?? 0;
   if (!width || !height) throw new Error('Не удалось прочитать размеры изображения');
 
-  const prefix = `img/${sha256.slice(0, 8)}`;
-  const widths = VARIANT_WIDTHS.filter((w) => w <= width);
-  // Совсем маленькая картинка: делаем один вариант в её собственном размере
-  if (widths.length === 0) widths.push(width);
+  const variants = await renderVariants(input, sha256, variantWidths(width));
+  return { width, height, blurhash: await makeBlurhash(input), variants };
+}
 
+/** Нарезать и выложить варианты нужных ширин в обоих форматах. */
+async function renderVariants(input: Buffer, sha256: string, widths: number[]): Promise<ImageVariant[]> {
+  const prefix = `img/${sha256.slice(0, 8)}`;
   const variants: ImageVariant[] = [];
   for (const w of widths) {
     const resized = sharp(input, { failOn: 'none' }).rotate().resize({ width: w, withoutEnlargement: true });
@@ -57,8 +74,27 @@ export async function processImage(originalKey: string, sha256: string): Promise
     await storage.put(webpKey, webp, 'image/webp');
     variants.push({ w, fmt: 'webp', key: webpKey, size: webp.length });
   }
+  return variants;
+}
 
-  return { width, height, blurhash: await makeBlurhash(input), variants };
+/**
+ * Дорезать картинке, обработанной по старой сетке, недостающие ширины.
+ * Готовые варианты не трогаем: их ключи неизменяемы и закэшированы навсегда.
+ * null — дорезать нечего.
+ */
+export async function addMissingVariants(media: {
+  key: string;
+  sha256: string;
+  width: number;
+  variants: ImageVariant[];
+}): Promise<ImageVariant[] | null> {
+  const have = new Set(media.variants.map((v) => v.w));
+  const missing = variantWidths(media.width).filter((w) => !have.has(w));
+  if (!missing.length) return null;
+
+  const input = await storage.getBuffer(media.key);
+  const added = await renderVariants(input, media.sha256, missing);
+  return [...media.variants, ...added].sort((a, b) => a.w - b.w || a.fmt.localeCompare(b.fmt));
 }
 
 /** Подложка-заглушка, чтобы при загрузке не прыгала вёрстка (CLS). */

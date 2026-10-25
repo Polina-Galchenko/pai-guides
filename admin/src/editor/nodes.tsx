@@ -94,18 +94,6 @@ function Frame({
 const EDITOR_IMAGE_MAX = 720;
 const GALLERY_THUMB_SIZES = '240px';
 
-/**
- * Варианты нарезаются по сетке 320/640/960/… и не шире исходника, так что
- * у скриншота в 900px самый крупный вариант — 640px. Оригинал добавляем
- * последним кандидатом: без него такой скриншот всё равно растягивался бы.
- */
-function editorSrcset(media: Media): string | undefined {
-  const variants = media.srcset.webp;
-  if (!variants || !media.width) return variants ?? undefined;
-  const widest = Math.max(0, ...media.variants.map((v) => v.w ?? 0));
-  return media.width > widest ? `${variants}, ${media.url} ${media.width}w` : variants;
-}
-
 function ImageView({ node, updateAttributes, selected, deleteNode, decorations }: NodeViewProps) {
   const media = useMedia(node.attrs.mediaId as number);
   const upload = decorations.find((d) => d.spec.upload)?.spec.upload as UploadState | undefined;
@@ -124,7 +112,7 @@ function ImageView({ node, updateAttributes, selected, deleteNode, decorations }
         {media ? (
           <img
             src={media.url}
-            srcSet={editorSrcset(media)}
+            srcSet={media.srcset.webp ?? undefined}
             sizes={`${Math.min(media.width ?? EDITOR_IMAGE_MAX, EDITOR_IMAGE_MAX)}px`}
             alt={(node.attrs.alt as string) ?? media.alt ?? ''}
             className="mx-auto max-h-96 max-w-full rounded-lg"
@@ -265,7 +253,7 @@ function GalleryItem({ mediaId, onRemove }: { mediaId: number; onRemove: () => v
       {media && (
         <img
           src={media.url}
-          srcSet={editorSrcset(media)}
+          srcSet={media.srcset.webp ?? undefined}
           sizes={GALLERY_THUMB_SIZES}
           alt={media.alt ?? ''}
           className="h-full w-full object-cover"

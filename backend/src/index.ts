@@ -11,8 +11,8 @@ import { prisma } from './db.js';
 import { ACCESS_COOKIE } from './auth.js';
 import { applySqlPatches } from './sqlPatches.js';
 import { startBot } from './bot.js';
-import { registerJob, setJobLogger, startJobs, stopJobs } from './jobs/index.js';
-import { registerMediaJobs } from './jobs/media.js';
+import { enqueue, registerJob, setJobLogger, startJobs, stopJobs } from './jobs/index.js';
+import { MEDIA_RESLICE, registerMediaJobs } from './jobs/media.js';
 import { registerBackupJobs, scheduleBackupJobs } from './jobs/backup.js';
 import { failStaleRuns } from './services/backup/index.js';
 import { registerAnalyticsJobs, scheduleAnalyticsJobs } from './jobs/analytics.js';
@@ -166,13 +166,15 @@ try {
     error: (e) => app.log.error(e),
   });
   // Сначала обработчики — их можно объявлять до старта очереди
-  await registerMediaJobs();
+  await registerMediaJobs((m) => app.log.info(m));
   await registerBackupJobs((m) => app.log.info(m));
   await registerAnalyticsJobs((m) => app.log.info(m));
   await startJobs();
   // Расписания — только после: без живой очереди cron ставить некуда
   await scheduleBackupJobs();
   await scheduleAnalyticsJobs();
+  // Дорезка вариантов картинкам со старой сетки — в фоне, старт не ждёт
+  await enqueue(MEDIA_RESLICE, {});
   void registerJob; // обработчики остальных задач регистрируются в своих модулях
 
   await app.listen({ port: env.port, host: env.host });
