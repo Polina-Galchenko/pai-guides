@@ -3,6 +3,7 @@ import { NodeViewContent, NodeViewWrapper, ReactNodeViewRenderer, type NodeViewP
 import { useEffect, useState } from 'react';
 import { AlertTriangle, CheckCircle2, FileText, Film, Info, OctagonAlert, Plus, Trash2, X } from 'lucide-react';
 import { api, type Media } from '../api';
+import type { UploadState } from './uploads';
 
 /**
  * Кастомные ноды из PLAN §4.1. Каждая ссылается на Media по id, а не на URL —
@@ -81,16 +82,52 @@ function Frame({
 
 // ============================ image ============================
 
-function ImageView({ node, updateAttributes, selected, deleteNode }: NodeViewProps) {
+/**
+ * Ширина картинки в колонке редактора. Раньше бралась первая запись srcset —
+ * самый маленький вариант, 320px, — и растягивалась вдвое-втрое: скриншоты
+ * в админке были мутными, хотя на сайте чёткие. Теперь вариант выбирает
+ * браузер — с учётом ширины колонки и плотности пикселей экрана.
+ *
+ * sizes задаёт и показанную ширину, поэтому не больше исходной: иначе
+ * скриншот кнопки в 200px растянулся бы на всю колонку.
+ */
+const EDITOR_IMAGE_MAX = 720;
+const GALLERY_THUMB_SIZES = '240px';
+
+/**
+ * Варианты нарезаются по сетке 320/640/960/… и не шире исходника, так что
+ * у скриншота в 900px самый крупный вариант — 640px. Оригинал добавляем
+ * последним кандидатом: без него такой скриншот всё равно растягивался бы.
+ */
+function editorSrcset(media: Media): string | undefined {
+  const variants = media.srcset.webp;
+  if (!variants || !media.width) return variants ?? undefined;
+  const widest = Math.max(0, ...media.variants.map((v) => v.w ?? 0));
+  return media.width > widest ? `${variants}, ${media.url} ${media.width}w` : variants;
+}
+
+function ImageView({ node, updateAttributes, selected, deleteNode, decorations }: NodeViewProps) {
   const media = useMedia(node.attrs.mediaId as number);
+  const upload = decorations.find((d) => d.spec.upload)?.spec.upload as UploadState | undefined;
+  const [dropHover, setDropHover] = useState(false);
+
   return (
     <Frame selected={selected} onDelete={deleteNode} label="картинка">
-      <figure className="group m-0">
+      <figure
+        className="group relative m-0"
+        onDragOver={(e) => setDropHover(isSingleImage(e.dataTransfer))}
+        onDragLeave={(e) => {
+          if (!e.currentTarget.contains(e.relatedTarget as globalThis.Node | null)) setDropHover(false);
+        }}
+        onDrop={() => setDropHover(false)}
+      >
         {media ? (
           <img
-            src={media.srcset.webp?.split(',')[0]?.trim().split(/\s+/)[0] ?? media.url}
+            src={media.url}
+            srcSet={editorSrcset(media)}
+            sizes={`${Math.min(media.width ?? EDITOR_IMAGE_MAX, EDITOR_IMAGE_MAX)}px`}
             alt={(node.attrs.alt as string) ?? media.alt ?? ''}
-            className="mx-auto max-h-96 rounded-lg"
+            className="mx-auto max-h-96 max-w-full rounded-lg"
           />
         ) : (
           <div className="flex h-32 items-center justify-center rounded-lg bg-ink-800 text-sm text-ink-500">
@@ -104,8 +141,43 @@ function ImageView({ node, updateAttributes, selected, deleteNode }: NodeViewPro
           value={(node.attrs.caption as string) ?? ''}
           onChange={(e) => updateAttributes({ caption: e.target.value })}
         />
+        {(upload || dropHover) && (
+          <div
+            contentEditable={false}
+            className={`pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2 rounded-lg px-6 text-center text-sm ${
+              upload?.error ? 'bg-red-950/80 text-red-200' : 'bg-ink-950/75 text-ink-100'
+            }`}
+          >
+            {upload ? (
+              <>
+                <span className="max-w-full truncate">Замена: {upload.label}</span>
+                {!upload.error && <ProgressBar pct={upload.pct} />}
+              </>
+            ) : (
+              'Отпустите, чтобы заменить картинку — подпись останется'
+            )}
+          </div>
+        )}
       </figure>
     </Frame>
+  );
+}
+
+/**
+ * Заменяет картинку только одна картинка (см. handleDrop в Editor) — пачка или
+ * PDF встанут рядом, и подсказка «заменить» соврала бы. Тип файла во время
+ * перетаскивания браузер может не отдать — тогда верим, что это картинка.
+ */
+function isSingleImage(dt: DataTransfer): boolean {
+  const item = dt.items.length === 1 ? dt.items[0] : undefined;
+  return item?.kind === 'file' && (item.type === '' || item.type.startsWith('image/'));
+}
+
+function ProgressBar({ pct }: { pct: number | null }) {
+  return (
+    <div className={`upload-placeholder__bar w-48${pct === null ? ' is-indeterminate' : ''}`}>
+      <div style={pct === null ? undefined : { width: `${pct}%` }} />
+    </div>
   );
 }
 
@@ -192,7 +264,9 @@ function GalleryItem({ mediaId, onRemove }: { mediaId: number; onRemove: () => v
     <div className="relative aspect-video overflow-hidden rounded bg-ink-800">
       {media && (
         <img
-          src={media.srcset.webp?.split(',')[0]?.trim().split(/\s+/)[0] ?? media.url}
+          src={media.url}
+          srcSet={editorSrcset(media)}
+          sizes={GALLERY_THUMB_SIZES}
           alt={media.alt ?? ''}
           className="h-full w-full object-cover"
         />

@@ -12,7 +12,7 @@ import TableCell from '@tiptap/extension-table-cell';
 import TableHeader from '@tiptap/extension-table-header';
 import CodeBlockLowlight from '@tiptap/extension-code-block-lowlight';
 import { Fragment, Slice } from '@tiptap/pm/model';
-import type { Transaction } from '@tiptap/pm/state';
+import { NodeSelection } from '@tiptap/pm/state';
 import { dropPoint } from '@tiptap/pm/transform';
 import { createLowlight, common } from 'lowlight';
 import {
@@ -28,29 +28,17 @@ import {
 } from 'lucide-react';
 import { CUSTOM_EXTENSIONS, primeMediaCache } from './nodes';
 import { INSERT_ITEMS, type InsertItem } from './insertItems';
+import { Outline, OutlineMenu } from './Outline';
+import { Uploads, addUpload, removeUpload, updateUpload, uploadPos } from './uploads';
 import { uploadFile } from '../lib/upload';
 import { errText, type Media } from '../api';
 
 const lowlight = createLowlight(common);
 
-/**
- * Позиция в документе, которая едет вместе с правками. Картинка грузится
- * секунды, видео — минуты, и всё это время текст выше места броска можно
- * править: без пересчёта файл вставился бы на старое смещение, то есть
- * посреди чужого абзаца.
- */
-function trackPosition(editor: TipTapEditor, pos: number) {
-  let current = pos;
-  const onTransaction = ({ transaction }: { transaction: Transaction }) => {
-    current = transaction.mapping.map(current);
-  };
-  editor.on('transaction', onTransaction);
-  return {
-    get pos() {
-      return Math.min(current, editor.state.doc.content.size);
-    },
-    stop: () => editor.off('transaction', onTransaction),
-  };
+/** Ближайшая к pos граница, где может стоять блок (в списке, таблице, шаге). */
+function fitBlock(editor: TipTapEditor, pos: number): number {
+  const probe = editor.schema.nodes.image!.create();
+  return dropPoint(editor.state.doc, pos, new Slice(Fragment.from(probe), 0, 0)) ?? pos;
 }
 
 /**
@@ -58,8 +46,7 @@ function trackPosition(editor: TipTapEditor, pos: number) {
  * всегда внутри абзаца. Сам ProseMirror выбрал бы сторону по месту в тексте:
  * левая половина строки — перед абзацем, правая — после. Человек же целится
  * между строк, поэтому решает вертикаль: верхняя половина абзаца — над ним,
- * нижняя — под ним. dropPoint затем сдвигает на ближайшее место, где блоку
- * можно стоять (в списке, таблице, шаге).
+ * нижняя — под ним.
  */
 function blockDropPos(editor: TipTapEditor, event: DragEvent): number | null {
   const hit = editor.view.posAtCoords({ left: event.clientX, top: event.clientY });
@@ -71,9 +58,115 @@ function blockDropPos(editor: TipTapEditor, event: DragEvent): number | null {
     const rect = (editor.view.nodeDOM($pos.before()) as HTMLElement | null)?.getBoundingClientRect();
     if (rect) pos = event.clientY < rect.top + rect.height / 2 ? $pos.before() : $pos.after();
   }
+  return fitBlock(editor, pos);
+}
 
-  const probe = editor.schema.nodes.image!.create();
-  return dropPoint(editor.state.doc, pos, new Slice(Fragment.from(probe), 0, 0)) ?? pos;
+/**
+ * Куда встанет скриншот из буфера. Не в курсор: блок посреди строки разрезал бы
+ * абзац пополам. Встаёт под абзацем с курсором, а на пустой строке — над ней,
+ * чтобы под скриншотом сразу можно было печатать дальше.
+ */
+function pastePos(editor: TipTapEditor): number {
+  const { selection } = editor.state;
+  if (selection instanceof NodeSelection) return selection.to;
+  const { $from } = selection;
+  if (!$from.parent.isTextblock || $from.depth === 0) return fitBlock(editor, $from.pos);
+  return fitBlock(editor, $from.parent.content.size === 0 ? $from.before() : $from.after());
+}
+
+/** Картинка под курсором мыши — файл, брошенный на неё, её заменяет. */
+function imageUnder(editor: TipTapEditor, event: DragEvent): number | null {
+  const hit = editor.view.posAtCoords({ left: event.clientX, top: event.clientY });
+  if (!hit || hit.inside < 0) return null;
+  return editor.state.doc.nodeAt(hit.inside)?.type.name === 'image' ? hit.inside : null;
+}
+
+const STAGE_LABEL = { hashing: 'подготовка', uploading: 'загрузка', processing: 'обработка' } as const;
+
+let lastUploadId = 0;
+
+/**
+ * Загрузка одного файла с прогрессом на его заглушке. При ошибке заглушка
+ * краснеет, называет причину и через несколько секунд исчезает сама.
+ */
+async function uploadShowingProgress(editor: TipTapEditor, file: File, id: string): Promise<Media | null> {
+  let stage: keyof typeof STAGE_LABEL = 'hashing';
+  let shownPct: number | null = null;
+  const show = (pct: number | null) => {
+    if (editor.isDestroyed) return;
+    shownPct = pct;
+    const suffix = pct === null ? '' : ` ${pct}%`;
+    updateUpload(editor.view, { id, label: `${file.name} — ${STAGE_LABEL[stage]}${suffix}`, pct });
+  };
+
+  try {
+    const { media } = await uploadFile(file, {
+      onStage: (s) => {
+        stage = s;
+        show(s === 'uploading' ? 0 : null);
+      },
+      // Событий прогресса у XHR сотни — перерисовываем только на смене процента
+      onProgress: (pct) => {
+        if (stage === 'uploading' && pct !== shownPct) show(pct);
+      },
+    });
+    primeMediaCache(media);
+    return media;
+  } catch (e) {
+    if (editor.isDestroyed) return null;
+    updateUpload(editor.view, { id, label: `${file.name}: ${errText(e)}`, pct: null, error: true });
+    setTimeout(() => {
+      if (!editor.isDestroyed) editor.view.dispatch(removeUpload(editor.state.tr, id));
+    }, 6000);
+    return null;
+  }
+}
+
+/**
+ * Файлы встают блоками в pos, по порядку. Заглушки появляются сразу на всю
+ * пачку — видно, что и куда встанет, — а грузятся файлы по одному: так первый
+ * гарантированно встаёт раньше второго и порядок не перемешивается.
+ */
+async function uploadInto(editor: TipTapEditor, files: File[], pos: number) {
+  const batch = files.map((file, i) => ({ file, id: `upload-${++lastUploadId}`, side: i + 1 }));
+  for (const { file, id, side } of batch) {
+    addUpload(editor.view, { id, kind: 'insert', label: file.name, pct: null }, pos, side);
+  }
+
+  for (const { file, id } of batch) {
+    const media = await uploadShowingProgress(editor, file, id);
+    if (!media || editor.isDestroyed) continue;
+    // Место берём у заглушки: пока шла загрузка, текст вокруг могли править
+    const at = uploadPos(editor.state, id);
+    if (!at) continue;
+    const type = media.type === 'VIDEO' ? 'video' : media.type === 'FILE' ? 'fileAttachment' : 'image';
+    editor
+      .chain()
+      .command(({ tr }) => !!removeUpload(tr, id))
+      // Курсор не трогаем: человек мог продолжить печатать в другом месте
+      .insertContentAt(at.from, { type, attrs: { mediaId: media.id } }, { updateSelection: false })
+      .run();
+  }
+}
+
+/** Новый файл у существующей картинки: подпись и прочие настройки остаются. */
+async function replaceImage(editor: TipTapEditor, file: File, pos: number) {
+  const id = `upload-${++lastUploadId}`;
+  addUpload(editor.view, { id, kind: 'replace', label: file.name, pct: null }, pos);
+
+  const media = await uploadShowingProgress(editor, file, id);
+  if (!media || editor.isDestroyed) return;
+  const at = uploadPos(editor.state, id);
+  if (!at) return; // картинку удалили, пока грузилась замена
+  editor
+    .chain()
+    .command(({ tr }) => {
+      removeUpload(tr, id);
+      const node = tr.doc.nodeAt(at.from);
+      if (node?.type.name === 'image') tr.setNodeMarkup(at.from, undefined, { ...node.attrs, mediaId: media.id });
+      return true;
+    })
+    .run();
 }
 
 export interface EditorHandle {
@@ -89,38 +182,9 @@ interface Props {
 }
 
 export function Editor({ initialContent, onChange, onPickMedia, onPickGuide, editable = true }: Props) {
-  const [uploading, setUploading] = useState<string | null>(null);
   const [slash, setSlash] = useState<{ x: number; y: number; query: string } | null>(null);
   const slashRef = useRef(slash);
   slashRef.current = slash;
-
-  /**
-   * Вставка скриншота из буфера — главная фича по скорости наполнения (§4.1).
-   * С `at` файл встаёт в отслеживаемую позицию (место броска), без — к курсору.
-   */
-  const uploadAndInsert = useCallback(
-    async (editor: TipTapEditor, file: File, at?: { pos: number }) => {
-      setUploading(file.name);
-      try {
-        const { media } = await uploadFile(file, {
-          onStage: (s) =>
-            setUploading(`${file.name} — ${s === 'hashing' ? 'хеш' : s === 'uploading' ? 'загрузка' : 'обработка'}`),
-        });
-        primeMediaCache(media);
-        const type = media.type === 'VIDEO' ? 'video' : media.type === 'FILE' ? 'fileAttachment' : 'image';
-        const node = { type, attrs: { mediaId: media.id } };
-        // Курсор не трогаем: пока файл грузился, человек мог продолжить печатать в другом месте
-        if (at) editor.chain().insertContentAt(at.pos, node, { updateSelection: false }).run();
-        else editor.chain().focus().insertContent(node).run();
-      } catch (e) {
-        setUploading(`Ошибка: ${file.name} — ${errText(e)}`);
-        setTimeout(() => setUploading(null), 4000);
-        return;
-      }
-      setUploading(null);
-    },
-    [],
-  );
 
   const editor = useEditor({
     editable,
@@ -145,40 +209,36 @@ export function Editor({ initialContent, onChange, onPickMedia, onPickGuide, edi
       TableCell,
       CodeBlockLowlight.configure({ lowlight }),
       ...CUSTOM_EXTENSIONS,
+      Uploads,
     ],
     content: (initialContent as never) ?? { type: 'doc', content: [{ type: 'paragraph' }] },
     editorProps: {
       attributes: {
         class: 'pai-editor focus:outline-none min-h-[50vh]',
       },
-      handlePaste(view, event) {
+      /** Вставка скриншота из буфера — главная фича по скорости наполнения (§4.1). */
+      handlePaste(_view, event) {
         const files = Array.from(event.clipboardData?.files ?? []);
         const media = files.filter((f) => /^(image|video)\//.test(f.type));
         if (!media.length) return false;
         event.preventDefault();
-        const ed = (view as unknown as { __editor?: TipTapEditor }).__editor;
-        void (async () => {
-          for (const file of media) await uploadAndInsert(ed ?? editorRef.current!, file);
-        })();
+        const ed = editorRef.current!;
+        void uploadInto(ed, media, pastePos(ed));
         return true;
       },
       // Файлы с компьютера встают туда, куда их бросили, а не к курсору.
-      // Одна позиция на все файлы: после вставки она сдвигается за вставленный
-      // блок, и пачка ложится в том порядке, в каком её тащили
+      // Одна картинка, брошенная на другую, заменяет её
       handleDrop(_view, event) {
         const files = Array.from((event as DragEvent).dataTransfer?.files ?? []);
         if (!files.length) return false;
         event.preventDefault();
         const ed = editorRef.current!;
-        const pos = blockDropPos(ed, event as DragEvent);
-        const at = pos === null ? undefined : trackPosition(ed, pos);
-        void (async () => {
-          try {
-            for (const file of files) await uploadAndInsert(ed, file, at);
-          } finally {
-            at?.stop();
-          }
-        })();
+        const image = imageUnder(ed, event as DragEvent);
+        if (image !== null && files.length === 1 && files[0]!.type.startsWith('image/')) {
+          void replaceImage(ed, files[0]!, image);
+        } else {
+          void uploadInto(ed, files, blockDropPos(ed, event as DragEvent) ?? ed.state.selection.to);
+        }
         return true;
       },
     },
@@ -281,71 +341,71 @@ export function Editor({ initialContent, onChange, onPickMedia, onPickGuide, edi
   if (!editor) return <div className="p-6 text-ink-500">Редактор загружается…</div>;
 
   return (
-    <div className="relative">
-      <Toolbar editor={editor} onInsert={runInsert} />
+    <div className="relative xl:flex xl:gap-6">
+      <aside className="hidden w-48 shrink-0 xl:block">
+        <Outline editor={editor} />
+      </aside>
 
-      {uploading && (
-        <div className="sticky top-0 z-20 mb-2 rounded-lg bg-brand-500/15 px-3 py-1.5 text-xs text-brand-200">
-          {uploading}
+      <div className="min-w-0 flex-1">
+        <Toolbar editor={editor} onInsert={runInsert} />
+
+        {/* Обёртка не для вёрстки: BubbleMenu уносит свой элемент в tippy, и без
+            неё React, вставляя что-то перед меню, падает на insertBefore — так
+            плашка загрузки роняла редактор в пустой экран */}
+        <div>
+          <BubbleMenu editor={editor} tippyOptions={{ duration: 100 }}>
+            <div className="flex items-center gap-0.5 rounded-lg border border-ink-700 bg-ink-900 p-1 shadow-xl">
+              <Mark editor={editor} name="bold" Icon={Bold} onClick={() => editor.chain().focus().toggleBold().run()} />
+              <Mark editor={editor} name="italic" Icon={Italic} onClick={() => editor.chain().focus().toggleItalic().run()} />
+              <Mark editor={editor} name="strike" Icon={Strikethrough} onClick={() => editor.chain().focus().toggleStrike().run()} />
+              <Mark editor={editor} name="code" Icon={Code} onClick={() => editor.chain().focus().toggleCode().run()} />
+              <Mark editor={editor} name="highlight" Icon={Highlighter} onClick={() => editor.chain().focus().toggleHighlight().run()} />
+              <button
+                type="button"
+                className="rounded p-1.5 text-ink-400 hover:bg-ink-800 hover:text-ink-200"
+                title="Ссылка"
+                onClick={() => {
+                  const prev = editor.getAttributes('link').href as string | undefined;
+                  const href = window.prompt('Адрес ссылки', prev ?? 'https://');
+                  if (href === null) return;
+                  if (href === '') editor.chain().focus().unsetLink().run();
+                  else editor.chain().focus().setLink({ href }).run();
+                }}
+              >
+                <LinkIcon size={14} />
+              </button>
+            </div>
+          </BubbleMenu>
         </div>
-      )}
 
-      {/* Обёртка не для вёрстки: BubbleMenu уносит свой элемент в tippy, и без
-          неё React, вставляя плашку загрузки перед меню, падает на insertBefore —
-          редактор становится пустым экраном на первом же скриншоте */}
-      <div>
-        <BubbleMenu editor={editor} tippyOptions={{ duration: 100 }}>
-          <div className="flex items-center gap-0.5 rounded-lg border border-ink-700 bg-ink-900 p-1 shadow-xl">
-            <Mark editor={editor} name="bold" Icon={Bold} onClick={() => editor.chain().focus().toggleBold().run()} />
-            <Mark editor={editor} name="italic" Icon={Italic} onClick={() => editor.chain().focus().toggleItalic().run()} />
-            <Mark editor={editor} name="strike" Icon={Strikethrough} onClick={() => editor.chain().focus().toggleStrike().run()} />
-            <Mark editor={editor} name="code" Icon={Code} onClick={() => editor.chain().focus().toggleCode().run()} />
-            <Mark editor={editor} name="highlight" Icon={Highlighter} onClick={() => editor.chain().focus().toggleHighlight().run()} />
-            <button
-              type="button"
-              className="rounded p-1.5 text-ink-400 hover:bg-ink-800 hover:text-ink-200"
-              title="Ссылка"
-              onClick={() => {
-                const prev = editor.getAttributes('link').href as string | undefined;
-                const href = window.prompt('Адрес ссылки', prev ?? 'https://');
-                if (href === null) return;
-                if (href === '') editor.chain().focus().unsetLink().run();
-                else editor.chain().focus().setLink({ href }).run();
-              }}
-            >
-              <LinkIcon size={14} />
-            </button>
+        {slash && filtered.length > 0 && (
+          <div
+            className="fixed z-50 max-h-72 w-64 overflow-y-auto rounded-lg border border-ink-700 bg-ink-900 p-1 shadow-2xl"
+            style={{ left: slash.x, top: slash.y }}
+          >
+            {filtered.map((item, i) => (
+              <button
+                key={item.title}
+                type="button"
+                onMouseEnter={() => setSlashIndex(i)}
+                onClick={() => void runInsert(item)}
+                className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm ${
+                  i === slashIndex ? 'bg-brand-500/20 text-brand-200' : 'text-ink-300 hover:bg-ink-800'
+                }`}
+              >
+                <item.Icon size={15} />
+                <span className="flex-1">{item.title}</span>
+                <span className="text-[10px] text-ink-600">{item.hint}</span>
+              </button>
+            ))}
           </div>
-        </BubbleMenu>
-      </div>
+        )}
 
-      {slash && filtered.length > 0 && (
-        <div
-          className="fixed z-50 max-h-72 w-64 overflow-y-auto rounded-lg border border-ink-700 bg-ink-900 p-1 shadow-2xl"
-          style={{ left: slash.x, top: slash.y }}
-        >
-          {filtered.map((item, i) => (
-            <button
-              key={item.title}
-              type="button"
-              onMouseEnter={() => setSlashIndex(i)}
-              onClick={() => void runInsert(item)}
-              className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm ${
-                i === slashIndex ? 'bg-brand-500/20 text-brand-200' : 'text-ink-300 hover:bg-ink-800'
-              }`}
-            >
-              <item.Icon size={15} />
-              <span className="flex-1">{item.title}</span>
-              <span className="text-[10px] text-ink-600">{item.hint}</span>
-            </button>
-          ))}
+        <EditorContent editor={editor} />
+
+        <div className="mt-4 border-t border-ink-800 pt-2 text-xs text-ink-600">
+          {editor.storage.characterCount.words()} слов · {editor.storage.characterCount.characters()} символов
         </div>
-      )}
-
-      <EditorContent editor={editor} />
-
-      <div className="mt-4 border-t border-ink-800 pt-2 text-xs text-ink-600">
-        {editor.storage.characterCount.words()} слов · {editor.storage.characterCount.characters()} символов
       </div>
     </div>
   );
@@ -430,6 +490,10 @@ function Toolbar({ editor, onInsert }: { editor: TipTapEditor; onInsert: (item: 
             ))}
           </div>
         )}
+      </div>
+
+      <div className="xl:hidden">
+        <OutlineMenu editor={editor} />
       </div>
 
       <span className="ml-auto text-[11px] text-ink-600">Ctrl+V или перетащите файл</span>
