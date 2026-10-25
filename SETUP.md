@@ -582,6 +582,19 @@ Cloudflare R2 удобен тем, что не берёт денег за исх
    с `AllowedOrigins`: последний wrangler отвергает. Проверить, что записалось:
    `wrangler r2 bucket cors list pai-media`.
 
+   **Origin — это адрес, который сейчас в строке браузера, а не тот, что был
+   при настройке.** Amvera перевела приложения с `pai-<ник>.amvera.io` на
+   `pai-<ник>.waw0.amvera.tech`; старого адреса в политике оказалось мало,
+   и загрузка молча встала: сайт и админка работают, а preflight с нового
+   домена R2 отклоняет с 403. Сменился домен (свой, новый от Amvera) —
+   сначала добавить его сюда и переустановить политику. Проверка без браузера:
+
+   ```
+   curl -i -X OPTIONS "https://<ACCOUNT_ID>.r2.cloudflarestorage.com/pai-media/x" -H "Origin: https://<адрес админки>" -H "Access-Control-Request-Method: PUT" -H "Access-Control-Request-Headers: content-type"
+   ```
+
+   204 с `Access-Control-Allow-Origin` — пропустит, 403 — нет.
+
 4. В переменные: `STORAGE_PROVIDER=r2`, `R2_ACCESS_KEY_ID`,
    `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_ENDPOINT`, `R2_PUBLIC_URL`.
    Для R2 достаточно `R2_ACCOUNT_ID` вместо `R2_ENDPOINT`. Для остальных
